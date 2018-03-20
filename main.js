@@ -1,3 +1,5 @@
+// depends on moment, moment-duration-format, jquery, lodash
+
 function isJsonValid(string) {
     try {
         JSON.parse(string);
@@ -57,52 +59,11 @@ class Storage {
 
 }
 
-class Analyzer {
-
-    constuctor() {
-
-    }
-
-}
-
-class ApiLinksGenerator {
-
-    constructor(url) {
-        this.parse(url);
-        this.apiPrefix = '/api/v1/sportdata';
-    }
-
-    parse(url) {
-        const regExp = /(events|race)\/([^\/]+)\/([^\/]+)/g;
-        let result;
-        while ((result = regExp.exec(url)) !== null) {
-            const [, type, name, id] = result;
-            this[type] = {name, id};
-        }
-        if (!this.events || !this.race) {
-            throw new Error('Cannot parse this url')
-        }
-    }
-
-    get event() {
-        return `${this.apiPrefix}/events/event/${this.events.id}/`
-    }
-
-    get raceInfo() {
-        return `${this.apiPrefix}/competitions/${this.events.id}/${this.race.id}/`
-    }
-
-    get raceResults() {
-        return `${this.apiPrefix}/results/race/${this.race.id}/`
-    }
-
-}
-
-class Event {
+class EventStorage {
 
     static save(event) {
         event.races = [];
-        if (Event.find(event.EventId)) {
+        if (EventStorage.find(event.EventId)) {
             return;
         }
         let allEvents = Storage.read('events');
@@ -114,52 +75,76 @@ class Event {
         const allEvents = Storage.read('events');
         return allEvents.find((event) => event.EventId === eventId);
     }
-
-    static findAllEvents() {
-        return Storage.read('events')
-    }
-
-    static saveAllEvents(events) {
-        Storage.write('events', events)
-    }
-
 }
 
-class Race {
+class RaceStorage {
 
     static save(race, eventId) {
         if (!race.results) {
             race.results = []
         }
-        let allEvents = Event.findAllEvents();
-        let event = allEvents.find((event) => event.EventId === eventId);
-        let raceFromStorage = event.races.find(currentRace => currentRace.RaceId === race.RaceId);
-        if (raceFromStorage) {
+        let data = RaceStorage.findData(race.RaceId, eventId);
+        if (data.raceFromStorage) {
             return;
         }
-        event.races.push(race);
-        Event.saveAllEvents(allEvents)
+        data.event.races.push(race);
+        Storage.write('events', data.allEvents)
     }
 
     static saveResults(results, raceId, eventId) {
-        let allEvents = Event.findAllEvents();
-        let event = allEvents.find((event) => event.EventId === eventId);
-        let raceFromStorage = event.races.find(currentRace => currentRace.RaceId === raceId);
-        if (!raceFromStorage) {
+        let data = RaceStorage.findData(raceId, eventId);
+        if (!data.raceFromStorage) {
             throw new Error('cannot save results for race without race info')
         }
-        raceFromStorage.results = results;
-        Event.saveAllEvents(allEvents)
+        data.raceFromStorage.results = results;
+        Storage.write('events', data.allEvents)
+    }
+
+    static findData(raceId, eventId) {
+        let allEvents = Storage.read('events');
+        let event = allEvents.find((event) => event.EventId === eventId);
+        let raceFromStorage = event.races.find(currentRace => currentRace.RaceId === raceId);
+        return {allEvents, event, raceFromStorage}
     }
 
 }
 
-async function saveResultsFromUrl(url) {
-    const linkGenerator = new ApiLinksGenerator(url);
+function parseCurrentUrl() {
+    const regExp = /(events|race)\/([^\/]+)\/([^\/]+)/g;
+    const url = window.location.href;
+    let result;
+    let eventId, raceId;
+    while ((result = regExp.exec(url)) !== null) {
+        const [, type, , id] = result;
+        if (type === 'events') {
+            eventId = id.toUpperCase();
+        } else if (type === 'race') {
+            raceId = id.toUpperCase();
+        }
+    }
+    if (!eventId || !raceId) {
+        throw new Error('Cannot parse this url')
+    }
+    return {eventId, raceId}
+}
+
+function generateLinks(eventId, raceId) {
+    const apiPrefix = '/api/v1/sportdata';
+    return {
+        event:`${apiPrefix}/events/event/${eventId}/`,
+        race: `${apiPrefix}/competitions/${eventId}/${raceId}/`,
+        raceResults: `${apiPrefix}/results/race/${raceId}/`
+    }
+}
+
+
+async function saveResultsFromCurrentPage() {
+    const {eventId, raceId} = parseCurrentUrl();
+    const links = generateLinks(eventId, raceId);
     const requests = [
-        getAjax(linkGenerator.event),
-        getAjax(linkGenerator.raceInfo),
-        getAjax(linkGenerator.raceResults)
+        getAjax(links.event),
+        getAjax(links.race),
+        getAjax(links.raceResults)
     ];
     let eventsResponse, racesResponse, racesResultsResponse;
     try {
@@ -172,17 +157,122 @@ async function saveResultsFromUrl(url) {
         const event = eventsResponse[0],
             race = racesResponse[0],
             raceResults = racesResultsResponse[0].Items;
-        Event.save(event);
-        Race.save(race, event.EventId);
-        Race.saveResults(raceResults, race.RaceId, event.EventId);
+        EventStorage.save(event);
+        RaceStorage.save(race, eventId);
+        RaceStorage.saveResults(raceResults, raceId, eventId);
     } catch (err) {
         throw new Error('There were some problems with saving race data')
     }
 }
 
+class Analyzer {
+
+    constructor (results) {
+        this.results = results;
+    }
+
+    createDuration (time) {
+        let splitTime = time
+            .split(':')
+            .map(timeString => parseFloat(timeString));
+        while (splitTime.length < 3) {
+            splitTime.unshift(0)
+        }
+        const [hours, minutes, seconds] = splitTime;
+        return moment.duration({hours, seconds, minutes})
+    }
+
+    removeShootPenalties() {
+        this.results = this.results.map(result => {
+            let resultCopy = _.clone(result);
+            if (!result.TotalTime) {
+                return resultCopy;
+            }
+            const totalTime = this.createDuration(result.TotalTime);
+            const penaltiesTime = moment.duration(this.penaltyLoopSecs * result.ShootingTotal, 's');
+            const pureTime = totalTime.subtract(penaltiesTime);
+            resultCopy.pureTime = pureTime.format('hh:mm:ss.S');
+            return resultCopy;
+        });
+    }
+
+    sortByPureTime() {
+        this.results = _.sortBy(this.results, 'pureTime')
+    }
+
+    logResults() {
+        const results = this.results.map(result => {
+            return {
+                time: result.pureTime,
+                name: result.Name
+            }
+        });
+        console.table(results);
+    }
+}
+
+class Sprint extends Analyzer{
+
+    constructor (results) {
+        super(results);
+        this.penaltyLoopSecs = 22.5;
+    }
+
+    getPureResults() {
+        this.removeShootPenalties();
+        this.sortByPureTime();
+        return this.results;
+    }
+
+}
+
+class Pursuit extends Analyzer {
+    constructor(results) {
+        super(results);
+        this.penaltyLoopSecs = 22.5;
+    }
+
+    getPureResults() {
+        this.removeStartDifference();
+        this.removeShootPenalties();
+        this.sortByPureTime();
+        return this.results;
+    }
+
+    removeStartDifference() {
+        this.results = this.results.map(result => {
+            let resultCopy = _.clone(result);
+            if (!result.StartInfo || result.StartInfo === '0.0' || !result.TotalTime) {
+                return resultCopy
+            }
+            let totalTime = this.createDuration(result.TotalTime);
+            const behindTime = this.createDuration(result.StartInfo.slice(1));
+            totalTime = totalTime.subtract(behindTime);
+            resultCopy.TotalTime = totalTime.format('hh:mm:ss.S');
+            return resultCopy
+        })
+    }
+}
+
+function analyzeCurrentPage() {
+    const links = parseCurrentUrl();
+    const raceData = RaceStorage.findData(links.raceId, links.eventId);
+    const raceType = raceData.raceFromStorage.ShortDescription;
+    let race;
+    if (raceType.match(/(mass start|sprint)/i)) {
+        race = new Sprint(raceData.raceFromStorage.results);
+    } else if (raceType.match(/pursuit/i)) {
+        race = new Pursuit(raceData.raceFromStorage.results);
+    }
+    race.getPureResults();
+    race.logResults();
+}
+
 async function startApplication() {
+    window.momentDurationFormatSetup(moment);
     Storage.init();
-    saveResultsFromUrl(window.location.href)
+    await saveResultsFromCurrentPage();
+    analyzeCurrentPage();
 }
 
 startApplication();
