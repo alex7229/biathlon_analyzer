@@ -215,7 +215,7 @@ class Sprint extends Analyzer{
 
     constructor (results) {
         super(results);
-        this.penaltyLoopSecs = 22.5;
+        this.penaltyLoopSecs = 25.5;
     }
 
     getPureResults() {
